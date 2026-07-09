@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
+	"time"
 
 	"github.com/Origami74/gonuts-tollgate/cashu"
 	"github.com/Origami74/gonuts-tollgate/cashu/nuts/nut04"
@@ -28,33 +30,120 @@ const (
 var (
 	ProofNotFound         = errors.New("proof not found")
 	KeysetMintURLNotFound = errors.New("keyset with mint url not found")
+
+	// openDBs tracks open bolt.DB instances keyed by absolute DB file path.
+	// This prevents Bolt's exclusive file lock from blocking when LoadWallet()
+	// is called twice on the same wallet path in the same process.
+	openDBs   = make(map[string]*openDBEntry)
+	openDBsMu sync.Mutex
 )
 
+type openDBEntry struct {
+	bolt        *bolt.DB
+	refs        int
+	initOnce    sync.Once
+	initialized chan struct{} // closed when initWalletBuckets+migration complete
+}
+
 type BoltDB struct {
-	bolt *bolt.DB
+	bolt   *bolt.DB
+	dbPath string
+}
+
+func dbFilePath(path string) string {
+	return filepath.Join(path, "wallet.db")
+}
+
+// getOrOpenDB returns an existing bolt.DB for the given path, or opens a new one.
+// Uses reference counting so Close() only closes when the last reference is released.
+// The returned entry's initCh may still be open if the opener is initializing buckets.
+func getOrOpenDB(path string) (*openDBEntry, error) {
+	dbPath := dbFilePath(path)
+
+	openDBsMu.Lock()
+	defer openDBsMu.Unlock()
+
+	if entry, ok := openDBs[dbPath]; ok {
+		entry.refs++
+		return entry, nil
+	}
+
+	dbb, err := bolt.Open(dbPath, 0600, &bolt.Options{Timeout: 1 * time.Second})
+	if err != nil {
+		return nil, fmt.Errorf("error setting bolt db: %v", err)
+	}
+
+	entry := &openDBEntry{
+		bolt:        dbb,
+		refs:        1,
+		initialized: make(chan struct{}),
+	}
+	openDBs[dbPath] = entry
+	return entry, nil
+}
+
+// releaseDB decrements the reference count for the given DB file path.
+// When the count reaches zero, the bolt.DB connection is actually closed.
+func releaseDB(dbPath string) error {
+	openDBsMu.Lock()
+	defer openDBsMu.Unlock()
+
+	entry, ok := openDBs[dbPath]
+	if !ok {
+		return nil // already closed
+	}
+
+	entry.refs--
+	if entry.refs <= 0 {
+		err := entry.bolt.Close()
+		delete(openDBs, dbPath)
+		return err
+	}
+	return nil
 }
 
 func InitBolt(path string) (*BoltDB, error) {
-	db, err := bolt.Open(filepath.Join(path, "wallet.db"), 0600, nil)
+	entry, err := getOrOpenDB(path)
 	if err != nil {
-		return nil, fmt.Errorf("error setting bolt db: %v", err)
+		return nil, err
 	}
 
-	boltdb := &BoltDB{bolt: db}
-	err = boltdb.initWalletBuckets()
+	dbPath := dbFilePath(path)
+	boltdb := &BoltDB{bolt: entry.bolt, dbPath: dbPath}
+
+	// sync.Once guarantees only one goroutine runs the initialization.
+	// All others block on the initialized channel until it completes.
+	entry.initOnce.Do(func() {
+		err = boltdb.initWalletBuckets()
+		if err != nil {
+			err = fmt.Errorf("error setting bolt db: %v", err)
+			close(entry.initialized)
+			return
+		}
+
+		if migrateErr := boltdb.MigrateInvoicesToQuotes(); migrateErr != nil {
+			err = fmt.Errorf("error migrating db: %v", migrateErr)
+			close(entry.initialized)
+			return
+		}
+
+		close(entry.initialized)
+	})
+
+	// If the initOnce caller failed, release our ref and return the error.
 	if err != nil {
-		return nil, fmt.Errorf("error setting bolt db: %v", err)
+		releaseDB(dbPath)
+		return nil, err
 	}
 
-	if err := boltdb.MigrateInvoicesToQuotes(); err != nil {
-		return nil, fmt.Errorf("error migrating db: %v", err)
-	}
+	// Wait for initialization to complete (no-op if already done).
+	<-entry.initialized
 
 	return boltdb, nil
 }
 
 func (db *BoltDB) Close() error {
-	return db.bolt.Close()
+	return releaseDB(db.dbPath)
 }
 
 func (db *BoltDB) initWalletBuckets() error {

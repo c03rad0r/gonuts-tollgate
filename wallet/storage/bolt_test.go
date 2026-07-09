@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"log"
 	"math"
 	"math/rand/v2"
@@ -12,7 +13,9 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Origami74/gonuts-tollgate/cashu"
 	"github.com/Origami74/gonuts-tollgate/cashu/nuts/nut04"
@@ -481,4 +484,114 @@ func generateRandomMeltQuotes(num int) []MeltQuote {
 		quotes[i] = quote
 	}
 	return quotes
+}
+
+// TestBoltDBSingleton verifies calling InitBolt on same path shares the
+// underlying bolt.DB instance with ref counting — prevents "LoadWallet
+// blocks forever when called twice" bug.
+func TestBoltDBSingleton(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "bolt-singleton-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	walletPath := tmpDir + "/wallet"
+	if err := os.MkdirAll(walletPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	db1, err := InitBolt(walletPath)
+	if err != nil {
+		t.Fatalf("First InitBolt failed: %v", err)
+	}
+
+	// Second InitBolt on same path — must be instant (shared connection)
+	start := time.Now()
+	db2, err := InitBolt(walletPath)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Second InitBolt failed: %v", err)
+	}
+	if elapsed > 100*time.Millisecond {
+		t.Errorf("Second InitBolt took %v — should be instant", elapsed)
+	}
+	if db1.bolt != db2.bolt {
+		t.Error("db1 and db2 must share the same underlying bolt.DB")
+	}
+
+	// Close db2 — ref count decremented, underlying bolt stays open
+	if err := db2.Close(); err != nil {
+		t.Fatalf("Close db2 failed: %v", err)
+	}
+
+	err = db1.SaveProofs([]cashu.Proof{{Secret: "test", Amount: 100, Id: "testid"}})
+	if err != nil {
+		t.Errorf("db1 must still work after db2 Close: %v", err)
+	}
+
+	// Close db1 — ref count hits zero, underlying bolt actually closes
+	if err := db1.Close(); err != nil {
+		t.Fatalf("Close db1 failed: %v", err)
+	}
+
+	// Fresh open after both closed — new bolt.DB instance
+	db3, err := InitBolt(walletPath)
+	if err != nil {
+		t.Fatalf("Third InitBolt failed: %v", err)
+	}
+	if db1.bolt == db3.bolt {
+		t.Error("db3 must be a new bolt.DB, not the old closed one")
+	}
+	if err := db3.Close(); err != nil {
+		t.Fatalf("Close db3 failed: %v", err)
+	}
+}
+
+// TestBoltDBConcurrentInit verifies concurrent InitBolt calls don't deadlock.
+func TestBoltDBConcurrentInit(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "bolt-concurrent-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	walletPath := tmpDir + "/wallet"
+	if err := os.MkdirAll(walletPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	const numGoroutines = 10
+	var wg sync.WaitGroup
+	errChan := make(chan error, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			db, err := InitBolt(walletPath)
+			if err != nil {
+				errChan <- fmt.Errorf("goroutine %d InitBolt: %v", id, err)
+				return
+			}
+			_ = db.GetSeed() // verify we can read
+		}(i)
+	}
+	wg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		t.Errorf("Concurrent init error: %v", err)
+	}
+
+	// Close all refs by calling releaseDB repeatedly until map is empty
+	for {
+		openDBsMu.Lock()
+		_, ok := openDBs[dbFilePath(walletPath)]
+		openDBsMu.Unlock()
+		if !ok {
+			break
+		}
+		releaseDB(dbFilePath(walletPath))
+	}
 }
